@@ -21,6 +21,7 @@
 #endif
 
 #include <cstdint>
+#include <deque>          // [FIX] m_outputs 改为 deque，避免 push_back 使 listener data 悬空
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -38,6 +39,7 @@
 
 namespace nativebridge::detail {
 
+class WaylandPlatform;   // [FIX] WaylandOutputState 需要反向指针，先前置声明
 class WaylandWindow;
 
 /// evdev scancode -> X11 keysym. Shared with the X11 backend's mapping table so
@@ -67,6 +69,8 @@ struct WaylandOutputState {
     uint32_t   scale{1};
     bool       hasMode{false};
     bool       done{false};
+
+    WaylandPlatform* platform{nullptr};  // [FIX] wl_output listener 的 data 指向本结构
 };
 
 /// The Wayland PlatformBackend implementation.
@@ -118,13 +122,17 @@ public:
     void handleGlobal(wl_registry* registry, uint32_t name, const char* interface, uint32_t version);
     void handleGlobalRemove(uint32_t name);
     void markDisplaysDirty() { m_displaysDirty = true; }
-    void onOutputMode(uint32_t flags, int32_t width, int32_t height, int32_t refreshMilliHz);
-    void onOutputScale(int32_t factor);
-    void onOutputName(const char* name);
-    void onOutputDescription(const char* description);
+
+    // [FIX] 每个 output 回调都携带自己的 state；不再用 m_currentOutput。
+    void onOutputMode(WaylandOutputState& state, uint32_t flags,
+                      int32_t width, int32_t height, int32_t refreshMilliHz);
+    void onOutputScale(WaylandOutputState& state, int32_t factor);
+    void onOutputName(WaylandOutputState& state, const char* name);
+    void onOutputDescription(WaylandOutputState& state, const char* description);
+
     void onSeatCapabilities(wl_seat* seat, uint32_t capabilities);
     /// Small helper used by WaylandWindow while creating its surface.
-    [[nodiscard]] const std::vector<WaylandOutputState>& outputsForWindow() const noexcept { return m_outputs; }
+    [[nodiscard]] const std::deque<WaylandOutputState>& outputsForWindow() const noexcept { return m_outputs; }
 
     // --- Input routing -----------------------------------------------------
     [[nodiscard]] WaylandWindow* windowForSurface(wl_surface* surface) const;
@@ -177,7 +185,8 @@ private:
 #ifdef NATIVEBRIDGE_HAVE_XDG_SHELL
     xdg_wm_base* m_wmBase{nullptr};
 #endif
-    std::vector<WaylandOutputState> m_outputs;
+
+    std::deque<WaylandOutputState> m_outputs;   // [FIX] 原来是 std::vector
 
     WaylandWindow* m_pointerFocus{nullptr};
     WaylandWindow* m_keyboardFocusWindow{nullptr};
@@ -186,6 +195,8 @@ private:
     uint32_t m_axisSource{0};
     Modifier m_modifiers{Modifier::None};
     Point    m_pointerPosition{0, 0};
+    Point    m_lastPointer{0, 0};        // [FIX] 新增
+    bool     m_hasLastPointer{false};    // [FIX] 新增
     double   m_pendingScrollX{0.0};
     double   m_pendingScrollY{0.0};
     bool     m_pendingScrollPrecise{false};
@@ -203,7 +214,7 @@ private:
     std::optional<Error>       m_fatal;
     std::thread::id            m_uiThread{std::this_thread::get_id()};
     WindowId                   m_nextWindowId{1};
-    std::mutex                 m_windowsMutex;
+    mutable std::mutex         m_windowsMutex;   // [FIX] 加 mutable（windowForSurface 是 const）
     std::vector<WaylandWindow*> m_windows;
 
     // Clipboard state.
@@ -285,6 +296,9 @@ public:
 
     [[nodiscard]] wl_surface* surface() const noexcept { return m_surface; }
     [[nodiscard]] bool isDestroyed() const noexcept { return m_destroyed; }
+
+    /// [FIX] surfaceEnter 回调需要访问 platform（用于实现 wl_surface.enter 时）。
+    [[nodiscard]] WaylandPlatform& platform() const noexcept { return m_platform; }
 
 private:
     void createSurface();

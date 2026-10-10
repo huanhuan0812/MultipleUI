@@ -212,7 +212,7 @@ std::vector<std::string> candidateBackends(const PlatformCreateInfo& info) {
         if (lowered == "wayland") {
             return {"wayland"};
         }
-        log::warn("NATIVEBRIDGE_LINUX_BACKEND has unknown value '" + *env + "', ignoring it");
+        detail::log::warn("NATIVEBRIDGE_LINUX_BACKEND has unknown value '" + *env + "', ignoring it");
     }
     const auto compiledDefault = detail::compiledDefaultLinuxBackend();
     if (compiledDefault == "x11") {

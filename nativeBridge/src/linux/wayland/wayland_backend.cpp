@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>          // [FIX] std::size(kEvdevKeysyms)
 #include <memory>
 #include <string>
 #include <utility>
@@ -144,7 +145,8 @@ constexpr uint32_t kXK_AudioPrev     = 0x1008FF16;
 constexpr uint32_t kXK_AudioNext     = 0x1008FF17;
 
 /// Fixed keysyms per evdev scancode 0..127; 0 means "no fixed keysym".
-constexpr uint32_t kEvdevKeysyms[128] = {
+/// [FIX] 去掉了显式 [128]，改为由初始化列表推导大小（原写法报 too many initializers）。
+constexpr uint32_t kEvdevKeysyms[] = {
     0,              kXK_Escape,     0x31,           0x32,           0x33,           0x34,
     0x35,           0x36,           0x37,           0x38,           0x39,           0x30,
     0x2D,           0x3D,           kXK_BackSpace,  kXK_Tab,        0x71,           0x77,
@@ -194,6 +196,15 @@ MouseButton mouseButtonFromEvdev(uint32_t code) {
     }
 }
 
+/// [FIX] Clipboard text flavours, best first. wl_data_offer / wl_data_source
+/// negotiate MIME types, so the first matching entry wins.
+constexpr const char* kTextMimeTypes[] = {
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -201,7 +212,7 @@ MouseButton mouseButtonFromEvdev(uint32_t code) {
 // ---------------------------------------------------------------------------
 
 uint32_t waylandKeysymFromEvdev(uint32_t evdev) noexcept {
-    constexpr std::size_t tableSize = sizeof(kEvdevKeysyms) / sizeof(kEvdevKeysyms[0]);
+    constexpr std::size_t tableSize = std::size(kEvdevKeysyms);   // [FIX] 用 std::size
     if (evdev < tableSize) {
         return kEvdevKeysyms[evdev];
     }
@@ -241,49 +252,48 @@ void registryGlobalRemove(void* data, wl_registry*, uint32_t name) {
 
 constexpr wl_registry_listener kRegistryListener = {&registryGlobal, &registryGlobalRemove};
 
-void outputGeometry(void* data, wl_output*, int32_t x, int32_t y, int32_t physicalWidth, int32_t physicalHeight,
-                    int32_t subpixel, const char* make, const char* model, int32_t transform) {
+// [FIX] 每个 output 的 listener data 现在是它自己的 WaylandOutputState*。
+// 原先 data 指向 WaylandPlatform，无法区分是哪个 output。
+
+void outputGeometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t,
+                    int32_t, const char*, const char*, int32_t) {
     // The (x, y) a compositor reports are private and may be identical for every
     // output. They are deliberately NOT used as DisplayInfo::bounds; see
     // WaylandPlatform::rebuildDisplays() for the documented layout strategy.
-    (void)data;
-    (void)x;
-    (void)y;
-    (void)physicalWidth;
-    (void)physicalHeight;
-    (void)subpixel;
-    (void)make;
-    (void)model;
-    (void)transform;
 }
 
 void outputMode(void* data, wl_output*, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
-    if (auto* platform = static_cast<WaylandPlatform*>(data); platform != nullptr) {
-        platform->onOutputMode(flags, width, height, refresh);
+    auto* state = static_cast<WaylandOutputState*>(data);
+    if (state != nullptr && state->platform != nullptr) {
+        state->platform->onOutputMode(*state, flags, width, height, refresh);
     }
 }
 
 void outputDone(void* data, wl_output*) {
-    if (auto* platform = static_cast<WaylandPlatform*>(data); platform != nullptr) {
-        platform->markDisplaysDirty();
+    auto* state = static_cast<WaylandOutputState*>(data);
+    if (state != nullptr && state->platform != nullptr) {
+        state->platform->markDisplaysDirty();
     }
 }
 
 void outputScale(void* data, wl_output*, int32_t factor) {
-    if (auto* platform = static_cast<WaylandPlatform*>(data); platform != nullptr) {
-        platform->onOutputScale(factor);
+    auto* state = static_cast<WaylandOutputState*>(data);
+    if (state != nullptr && state->platform != nullptr) {
+        state->platform->onOutputScale(*state, factor);
     }
 }
 
 void outputName(void* data, wl_output*, const char* name) {
-    if (auto* platform = static_cast<WaylandPlatform*>(data); platform != nullptr && name != nullptr) {
-        platform->onOutputName(name);
+    auto* state = static_cast<WaylandOutputState*>(data);
+    if (state != nullptr && state->platform != nullptr && name != nullptr) {
+        state->platform->onOutputName(*state, name);
     }
 }
 
 void outputDescription(void* data, wl_output*, const char* description) {
-    if (auto* platform = static_cast<WaylandPlatform*>(data); platform != nullptr && description != nullptr) {
-        platform->onOutputDescription(description);
+    auto* state = static_cast<WaylandOutputState*>(data);
+    if (state != nullptr && state->platform != nullptr && description != nullptr) {
+        state->platform->onOutputDescription(*state, description);
     }
 }
 
@@ -355,9 +365,13 @@ void pointerAxisDiscrete(void* data, wl_pointer*, uint32_t axis, int32_t discret
     }
 }
 
+// [FIX] 补上 wl_pointer_listener 的两个新回调槽位（协议 >= 8/9）。
+// 我们 bind 到版本 5，这两个回调不会被触发，填 nullptr 即可。
 constexpr wl_pointer_listener kPointerListener = {
     &pointerEnter,     &pointerLeave,      &pointerMotion, &pointerButton, &pointerAxis,
     &pointerFrame,     &pointerAxisSource, &pointerAxisStop, &pointerAxisDiscrete,
+    nullptr,           // axis_value120        (protocol >= 8)
+    nullptr,           // axis_relative_direction (protocol >= 9)
 };
 
 void keyboardKeymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) {
@@ -567,39 +581,34 @@ private:
 // WaylandOutputState bookkeeping
 // ---------------------------------------------------------------------------
 
-void WaylandPlatform::onOutputMode(uint32_t flags, int32_t width, int32_t height, int32_t refreshMilliHz) {
-    // find the output whose listener is currently being dispatched: the listener
-    // stores it in m_currentOutput before calling in.
-    WaylandOutputState* state = m_currentOutput;
-    if (state == nullptr) {
-        return;
-    }
+// [FIX] 全部改成接收 WaylandOutputState& —— 不再依赖不存在的 m_currentOutput。
+
+void WaylandPlatform::onOutputMode(WaylandOutputState& state, uint32_t flags,
+                                   int32_t width, int32_t height, int32_t refreshMilliHz) {
     if ((flags & WL_OUTPUT_MODE_CURRENT) != 0) {
-        state->pixelWidth = width;
-        state->pixelHeight = height;
-        state->refreshMilliHz = refreshMilliHz > 0 ? static_cast<uint32_t>(refreshMilliHz) : 0;
-        state->hasMode = true;
+        state.pixelWidth  = width;
+        state.pixelHeight = height;
+        state.refreshMilliHz = refreshMilliHz > 0 ? static_cast<uint32_t>(refreshMilliHz) : 0;
+        state.hasMode = true;
     }
     m_displaysDirty = true;
 }
 
-void WaylandPlatform::onOutputScale(int32_t factor) {
-    if (m_currentOutput != nullptr && factor > 0) {
-        m_currentOutput->scale = static_cast<uint32_t>(factor);
+void WaylandPlatform::onOutputScale(WaylandOutputState& state, int32_t factor) {
+    if (factor > 0) {
+        state.scale = static_cast<uint32_t>(factor);
         m_scale = std::max(m_scale, static_cast<double>(factor));
     }
     m_displaysDirty = true;
 }
 
-void WaylandPlatform::onOutputName(const char* name) {
-    if (m_currentOutput != nullptr) {
-        m_currentOutput->info.name = name;
-    }
+void WaylandPlatform::onOutputName(WaylandOutputState& state, const char* name) {
+    state.info.name = name;
 }
 
-void WaylandPlatform::onOutputDescription(const char* description) {
-    if (m_currentOutput != nullptr && m_currentOutput->info.name.empty()) {
-        m_currentOutput->info.name = description;
+void WaylandPlatform::onOutputDescription(WaylandOutputState& state, const char* description) {
+    if (state.info.name.empty()) {
+        state.info.name = description;
     }
 }
 
@@ -859,12 +868,15 @@ void WaylandPlatform::handleGlobal(wl_registry* registry, uint32_t name, const c
     } else if (iface == wl_data_device_manager_interface.name && m_dataDeviceManager == nullptr) {
         m_dataDeviceManager = static_cast<wl_data_device_manager*>(bind(&wl_data_device_manager_interface, 3));
     } else if (iface == wl_output_interface.name) {
+        // [FIX] listener 的 data 必须指向容器里那个 state。
+        // 用 deque 保证 push_back 之后已有元素的地址不会变。
         WaylandOutputState state{};
         state.globalName = name;
-        state.output = static_cast<wl_output*>(bind(&wl_output_interface, 4));
+        state.platform   = this;
+        state.output     = static_cast<wl_output*>(bind(&wl_output_interface, 4));
         if (state.output != nullptr) {
-            wl_output_add_listener(state.output, &kOutputListener, this);
-            m_outputs.push_back(state);
+            m_outputs.push_back(std::move(state));
+            wl_output_add_listener(m_outputs.back().output, &kOutputListener, &m_outputs.back());
             m_displaysDirty = true;
         }
 #ifdef NATIVEBRIDGE_HAVE_XDG_SHELL
@@ -1104,7 +1116,12 @@ void WaylandPlatform::onPointerPosition(double x, double y) {
 
     MouseMoveEvent payload{};
     payload.position = position;
-    payload.delta = Point{position.x - m_lastPointer.x, position.y - m_lastPointer.y};
+    // [FIX] 第一次移动时 delta 应该为 0，而不是相对 (0,0) 的巨大偏移。
+    if (m_hasLastPointer) {
+        payload.delta = Point{position.x - m_lastPointer.x, position.y - m_lastPointer.y};
+    } else {
+        payload.delta = Point{0, 0};
+    }
     payload.modifiers = m_modifiers;
     payload.isDragging = anyButtonPressed();
     m_hasLastPointer = true;
@@ -1126,6 +1143,7 @@ void WaylandPlatform::onPointerLeave() {
     event.payload = payload;
     m_queue.push(std::move(event));
     m_pointerFocus = nullptr;
+    m_hasLastPointer = false;   // [FIX] 重新进入窗口时再从 0 开始算 delta
 }
 
 void WaylandPlatform::trackPressedButton(uint32_t button, bool pressed) {
@@ -1215,6 +1233,7 @@ void WaylandPlatform::flushPointerEvents() {
 }
 
 void WaylandPlatform::onKeyboardFocus(WaylandWindow* window, bool entered) {
+    (void)entered;   // [FIX] 之前未使用，加 (void) 消除 warning
     if (window != nullptr) {
         m_keyboardFocusWindow = window;
         const FocusEvent payload{true};
@@ -1530,14 +1549,11 @@ void WaylandWindow::createSurface() {
         xdg_toplevel_set_max_size(m_toplevel, m_maxSize.width, m_maxSize.height);
     }
 
-    // Announce the outputs we know about. This is only a hint (the compositor
-    // decides which output the surface is on); the real scale factor arrives
-    // later as a wl_surface.enter event, which is handled by the platform.
-    for (const WaylandOutputState& output : m_platform.outputsForWindow()) {
-        if (output.output != nullptr) {
-            wl_surface_enter_output(m_surface, output.output);
-        }
-    }
+    // [FIX] 删除了对不存在的 wl_surface_enter_output 的调用。
+    // 一个 surface 位于哪个 output 由 compositor 通过 wl_surface.enter 事件告知；
+    // 客户端不能主动“加入”某个 output。要真正获得每窗口的 scale，需要在这里挂
+    // 一个 wl_surface_listener 处理 enter/leave，见实现说明。
+
     // The initial commit maps the surface; the configure event follows and must
     // be acknowledged before the first buffer is attached.
     wl_surface_commit(m_surface);
